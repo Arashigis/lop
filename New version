@@ -1,0 +1,455 @@
+from controller import Robot
+import math
+from collections import deque, defaultdict
+
+# ============================================================
+# 1) ДЕТЕКТОР ЦИЛИНДРОВ (твоя версия, без изменений логики)
+# ============================================================
+class CylinderScanner:
+    def __init__(self, robot, camera_name='camera'):
+        self.robot = robot
+        self.timestep = int(robot.getBasicTimeStep())
+
+        # Камера
+        self.camera = robot.getDevice(camera_name)
+        self.camera.enable(self.timestep)
+        self.width = self.camera.getWidth()
+        self.height = self.camera.getHeight()
+
+        # Датчики пола (черная метка)
+        self.gs_l = robot.getDevice('ground left infrared sensor')
+        self.gs_r = robot.getDevice('ground right infrared sensor')
+        self.gs_l.enable(self.timestep)
+        self.gs_r.enable(self.timestep)
+
+        self.count = 0
+        self.cooldown = 0
+        self.ignore_start = 200
+        self.finished = False
+
+    def update_and_check(self):
+        if self.finished:
+            return False
+
+        if self.ignore_start > 0:
+            self.ignore_start -= 1
+            return False
+
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            return False
+
+        # Порог 500: черный ~250 (как у тебя)
+        on_black = (self.gs_l.getValue() < 500 or self.gs_r.getValue() < 500)
+
+        if on_black and self._is_yellow_in_view():
+            self.count += 1
+            self.cooldown = 450
+            print(f"Объект обнаружен! Текущее количество: {self.count}")
+
+            if self.count >= 8:
+                self.finished = True
+            return True
+
+        return False
+
+    def _is_yellow_in_view(self):
+        img = self.camera.getImage()
+        if not img:
+            return False
+
+        yellow_pixels = 0
+        for x in range(self.width // 3, 2 * self.width // 3):
+            for y in range(self.height // 2, self.height):
+                r = self.camera.imageGetRed(img, self.width, x, y)
+                g = self.camera.imageGetGreen(img, self.width, x, y)
+                b = self.camera.imageGetBlue(img, self.width, x, y)
+                if r > 170 and g > 170 and b < 90:
+                    yellow_pixels += 1
+
+        return yellow_pixels > 12
+
+    def print_final_message(self):
+        print(f"Программа выполнена. Количество объектов - {self.count:02d}")
+
+
+# ============================================================
+# 2) КАРТА (0 = проход, 1 = стена, 2..9 = целевые зоны)
+# ============================================================
+RAW_MAP = """
+000000000000000000000000000000110000000000000000
+000000000000000000000000000000110000000000000000
+000000000000000000022220000000110000000000000000
+000000000000000110022220000000110000000000000000
+000000000000000110022220000000110000000000000000
+000000000000000111111111111000110000000000000000
+000000000000000111111111111000113330000000000000
+000000000000000110000000000000113330000000000000
+000000000000000110000000000000113330000000000000
+000000000000000110000000000000111111111000000000
+000000000000000110000000000000111111111000000000
+000000000000000110000000000000000000000000000000
+000000000000000110000000000000000000000000000000
+000000000000000110000000000000000000000000000000
+000000000000000110000000000000000000000000000000
+000000000000000119990000000110000000000000000000
+000000000000000119990000000110000000000000000000
+000000000000000119990000000110000000000000000000
+000000001111111111110000000111111111000000000000
+000000001111111111110000000111111111000000000000
+000000000000000000000000000110000000000000000000
+000000000000000000000000000110000000000000000000
+111111111111100000000000000110000000011444000000
+111111111111100000000000000110000000011444000000
+000000000001100000000000000110000000011444000000
+000000000001100000000000000110000000011444000000
+000000000001100000001111100110000000011000000000
+000000000001100000001111100000001100011000000000
+000000000001100000007771100000001100011000000000
+000000000001100000007771100000001100011000000000
+000000000001100000007771100000001100011000000000
+000000008881100000000001100000001100011000000000
+000000008881100000000001100000001100011000000000
+000000008881100000000001100000001100011000000000
+000000001111111100000001100000001100000000000000
+000000001111111100000001100000001155500000000000
+000000000000000000000001100000001155500000000000
+000000000000000000000001100000001155500000000000
+000000000000000000000001100001111111111110000000
+000000000000000000000001166601111111111110000000
+000000000000000000000001166600000000000000000000
+000000000000000000000001166600000000000000000000
+000000000000000000000001111100000000000000000000
+000000000000000110000001111100000000000000000000
+000000000000000110000000000000000000000000000000
+000000000000000110000000000000000000000000000000
+000000000000000110000000000000000000000000000000
+""".strip()
+
+# ============================================================
+# 3) НАСТРОЙКИ РОБОТА / МИРА
+# ============================================================
+robot = Robot()
+TS = int(robot.getBasicTimeStep())
+
+WHEEL_RADIUS = 0.021
+AXLE = 0.1054
+
+CELL_SIZE = 0.0625     # <-- если у тебя клетка 0.25м, поставь 0.25
+
+SPEED_FWD  = 6.0
+SPEED_TURN = 3.0
+KP_HEADING = 7.0
+
+# ДЫРКИ: подстрой по значениям ground IR (на дырке обычно сильно меньше)
+HOLE_THR = 20.0
+
+# ============================================================
+# 4) УСТРОЙСТВА
+# ============================================================
+lm = robot.getDevice("left wheel motor")
+rm = robot.getDevice("right wheel motor")
+lm.setPosition(float('inf'))
+rm.setPosition(float('inf'))
+lm.setVelocity(0.0)
+rm.setVelocity(0.0)
+
+le = robot.getDevice("left wheel sensor")
+re = robot.getDevice("right wheel sensor")
+le.enable(TS)
+re.enable(TS)
+
+gyro = robot.getDevice("gyro")
+gyro.enable(TS)
+
+g_l  = robot.getDevice("ground left infrared sensor")
+g_r  = robot.getDevice("ground right infrared sensor")
+g_fl = robot.getDevice("ground front left infrared sensor")
+g_fr = robot.getDevice("ground front right infrared sensor")
+for s in (g_l, g_r, g_fl, g_fr):
+    s.enable(TS)
+
+# ИНИЦ детектора цилиндров
+scanner = CylinderScanner(robot, camera_name='camera')
+
+robot.step(TS)
+
+# ============================================================
+# 5) ПАРСИНГ КАРТЫ + ЦЕЛИ
+# ============================================================
+GRID = [list(row) for row in RAW_MAP.splitlines()]
+H = len(GRID)
+W = len(GRID[0])
+
+targets = defaultdict(list)  # digit -> [(x,y),...]
+for y in range(H):
+    for x in range(W):
+        c = GRID[y][x]
+        if c.isdigit() and c not in ('0', '1'):
+            targets[int(c)].append((x, y))
+
+target_digits = sorted([d for d in targets.keys() if 2 <= d <= 9])
+
+# ============================================================
+# 6) ДВИЖЕНИЕ / ОРИЕНТАЦИЯ
+# ============================================================
+CURRENT_ANGLE = 0.0
+TARGET_HEADING = 0.0
+
+def normalize_angle(a):
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a < -math.pi:
+        a += 2 * math.pi
+    return a
+
+def stop():
+    lm.setVelocity(0.0)
+    rm.setVelocity(0.0)
+
+def step_and_update():
+    """Единственная функция шага симуляции: тут и гироскоп, и цилиндры."""
+    global CURRENT_ANGLE
+
+    if robot.step(TS) == -1:
+        return False
+
+    # Гироскоп
+    wz = gyro.getValues()[2]
+    CURRENT_ANGLE += wz * (TS / 1000.0)
+
+    # Детектор цилиндров (не ломает движение, просто считает)
+    scanner.update_and_check()
+
+    return True
+
+def is_hole_now():
+    vals = [g_l.getValue(), g_r.getValue(), g_fl.getValue(), g_fr.getValue()]
+    return any(v < HOLE_THR for v in vals)
+
+def soft_stop():
+    for v in [2.0, 1.0, 0.5, 0.0]:
+        lm.setVelocity(v)
+        rm.setVelocity(v)
+        if not step_and_update():
+            break
+
+def back_off_short():
+    lm.setVelocity(-2.0)
+    rm.setVelocity(-2.0)
+    for _ in range(8):
+        if not step_and_update():
+            break
+    soft_stop()
+
+def turn_to_heading(heading):
+    global TARGET_HEADING
+    TARGET_HEADING = heading
+    while True:
+        if not step_and_update():
+            return
+        err = normalize_angle(TARGET_HEADING - CURRENT_ANGLE)
+        if abs(err) < 0.015:
+            break
+        sp = max(0.8, min(SPEED_TURN, abs(err) * 6.0))
+        if err > 0:
+            lm.setVelocity(-sp)
+            rm.setVelocity(+sp)
+        else:
+            lm.setVelocity(+sp)
+            rm.setVelocity(-sp)
+    stop()
+    for _ in range(2):
+        step_and_update()
+
+def turn_left_90():
+    global TARGET_HEADING
+    TARGET_HEADING += math.pi/2
+    turn_to_heading(TARGET_HEADING)
+
+def turn_right_90():
+    global TARGET_HEADING
+    TARGET_HEADING -= math.pi/2
+    turn_to_heading(TARGET_HEADING)
+
+def move_one_cell_forward():
+    start_l = le.getValue()
+    start_r = re.getValue()
+    target_phi = CELL_SIZE / WHEEL_RADIUS
+
+    while True:
+        if not step_and_update():
+            return False
+
+        # Если нашли 8 цилиндров — можно завершать миссию раньше
+        if scanner.finished:
+            return True
+
+        if is_hole_now():
+            stop()
+            for _ in range(2):
+                step_and_update()
+            back_off_short()
+            return False
+
+        dl = abs(le.getValue() - start_l)
+        dr = abs(re.getValue() - start_r)
+        if (dl + dr) / 2.0 >= target_phi:
+            break
+
+        err = normalize_angle(TARGET_HEADING - CURRENT_ANGLE)
+        corr = KP_HEADING * err
+
+        vl = SPEED_FWD - corr
+        vr = SPEED_FWD + corr
+        vl = max(-12.0, min(12.0, vl))
+        vr = max(-12.0, min(12.0, vr))
+
+        lm.setVelocity(vl)
+        rm.setVelocity(vr)
+
+    soft_stop()
+    return True
+
+# ============================================================
+# 7) BFS ПО КАРТЕ
+# ============================================================
+DIRS = [(1,0),(0,1),(-1,0),(0,-1)]  # E,S,W,N
+
+def in_bounds(x, y):
+    return 0 <= x < W and 0 <= y < H
+
+def passable(x, y, blocked):
+    if (x, y) in blocked:
+        return False
+    return GRID[y][x] != '1'
+
+def bfs_path(start, goal_cells, blocked):
+    sx, sy = start
+    goals = set(goal_cells)
+    if (sx, sy) in goals:
+        return [(sx, sy)]
+
+    q = deque([(sx, sy)])
+    prev = {(sx, sy): None}
+
+    while q:
+        x, y = q.popleft()
+        for dx, dy in DIRS:
+            nx, ny = x + dx, y + dy
+            if not in_bounds(nx, ny):
+                continue
+            if (nx, ny) in prev:
+                continue
+            if not passable(nx, ny, blocked):
+                continue
+            prev[(nx, ny)] = (x, y)
+            if (nx, ny) in goals:
+                # восстановление
+                path = [(nx, ny)]
+                cur = (x, y)
+                while cur is not None:
+                    path.append(cur)
+                    cur = prev[cur]
+                path.reverse()
+                return path
+            q.append((nx, ny))
+    return None
+
+def dir_from_step(a, b):
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    if (dx, dy) == (1, 0):  return 0
+    if (dx, dy) == (0, 1):  return 1
+    if (dx, dy) == (-1, 0): return 2
+    if (dx, dy) == (0, -1): return 3
+    return 0
+
+def rotate_to_dir(cur_dir, need_dir):
+    diff = (need_dir - cur_dir) % 4
+    if diff == 0:
+        return cur_dir
+    if diff == 1:
+        turn_right_90()
+        return (cur_dir + 1) % 4
+    if diff == 3:
+        turn_left_90()
+        return (cur_dir - 1) % 4
+    if diff == 2:
+        turn_right_90(); turn_right_90()
+        return (cur_dir + 2) % 4
+    return cur_dir
+
+# ============================================================
+# 8) СТАРТ
+# ============================================================
+START_X, START_Y = 0, 0
+cur_cell = (START_X, START_Y)
+cur_dir = 0  # East
+CURRENT_ANGLE = 0.0
+TARGET_HEADING = 0.0
+
+blocked_by_holes = set()
+
+print(f"START cell={cur_cell}, dir=E, HxW={H}x{W}")
+print(f"Targets digits found: {target_digits}")
+
+# ============================================================
+# 9) ОСНОВНАЯ ЛОГИКА: едем по зонам 2..9, параллельно считаем цилиндры
+# ============================================================
+for d in target_digits:
+    if scanner.finished:
+        break
+
+    goal_cells = targets[d]
+    print(f"\n=== TARGET {d}: cells={len(goal_cells)} ===")
+
+    while True:
+        if scanner.finished:
+            break
+
+        path = bfs_path(cur_cell, goal_cells, blocked_by_holes)
+        if not path:
+            print(f"Нет пути к зоне {d}. Пропуск.")
+            break
+
+        reached = False
+
+        for i in range(1, len(path)):
+            if scanner.finished:
+                reached = True
+                break
+
+            nxt = path[i]
+            need_dir = dir_from_step(cur_cell, nxt)
+            cur_dir = rotate_to_dir(cur_dir, need_dir)
+
+            ok = move_one_cell_forward()
+            if not ok:
+                blocked_by_holes.add(nxt)
+                print(f"HOLE detected -> block cell {nxt} and replan...")
+                reached = False
+                break
+
+            cur_cell = nxt
+
+            if cur_cell in goal_cells:
+                print(f"ARRIVED to target zone {d} at cell={cur_cell}")
+                reached = True
+                break
+
+        if reached:
+            stop()
+            for _ in range(10):
+                step_and_update()
+            break
+
+# ============================================================
+# 10) ФИНИШ
+# ============================================================
+stop()
+for _ in range(10):
+    step_and_update()
+
+scanner.print_final_message()
